@@ -1,199 +1,230 @@
-# xe-tu-hanh
 import time
 from machine import PWM, Pin
 
-# --- CẤU HÌNH ĐỘNG CƠ (L298N) ---
-in1 = Pin(32, Pin.OUT)  # Đổi từ 34 sang 32 vì GPIO 34 chỉ là chân Input
-in2 = Pin(25, Pin.OUT)
-in3 = Pin(33, Pin.OUT)
-in4 = Pin(26, Pin.OUT)
+# ============================================================
+#  CẤU HÌNH CHÂN
+# ============================================================
+in1 = Pin(27, Pin.OUT, value=0)  # bánh phải (tiến)
+in2 = Pin(19, Pin.OUT, value=0)  # bánh phải (lùi)
+in3 = Pin(25, Pin.OUT, value=0)  # bánh trái (tiến)
+in4 = Pin(33, Pin.OUT, value=0)  # bánh trái (lùi)
 
-# Tốc độ động cơ (ENA, ENB dùng các chân GPIO dự phòng)
-ena = PWM(Pin(4, Pin.OUT), freq=1000)
-enb = PWM(Pin(16, Pin.OUT), freq=1000)
+ir_left = Pin(39, Pin.IN)        # GPIO34/39 là chân chỉ đọc
+ir_right = Pin(34, Pin.IN)
 
-SPEED = 700  # Tốc độ từ 0 đến 1023
+ENA_PIN = 18                     # ENA điều khiển bánh PHẢI
+ENB_PIN = 23                     # ENB điều khiển bánh TRÁI
+PWM_FREQ = 5000
 
+ena = PWM(Pin(ENA_PIN), freq=PWM_FREQ, duty=0)
+enb = PWM(Pin(ENB_PIN), freq=PWM_FREQ, duty=0)
 
-def set_speed(speed_left, speed_right):
-  try:
-    ena.duty(speed_left)
-    enb.duty(speed_right)
-  except:
-    pass
+# ============================================================
+#  THÔNG SỐ CẦN HIỆU CHỈNH
+# ============================================================
+TEST_MOTOR = False
+LEFT_REVERSED = False
+RIGHT_REVERSED = True
+ON_LINE = 1                      # Giá trị cảm biến khi nằm TRÊN vạch
+START_DELAY_S = 2
+DEBUG = True
 
+BASE_SPEED = 800                 # Tốc độ đi thẳng (0-1023)
+TURN_SPEED = 750                 # Tốc độ quay tại chỗ khi rẽ
 
-def move_forward():
-  in1.value(1)
-  in2.value(0)
-  in3.value(1)
-  in4.value(0)
-  set_speed(SPEED, SPEED)
+# --- RẼ "CHỐT" ---
+# Chỉ cần cảm biến nháy MỘT cái là xe chốt rẽ:
+#   1) Quay đủ TURN_TIME_MS, BỎ QUA hoàn toàn cảm biến
+#   2) Hết thời gian đó mà cảm biến còn đen (góc dày) -> quay tiếp
+#      cho đến khi CẢ HAI cảm biến hết đen (vạch nằm giữa lại)
+#   3) Phanh ngắn rồi đi thẳng
+TURN_TIME_MS = 50               # Thời gian quay tối thiểu (hết giờ mà còn đen thì quay tiếp)
+TURN_PAUSE_MS = 0                # Dừng trước khi rẽ (ms). 1000 = dừng 1 giây
+TURN_BRAKE_MS = 30               # Phanh ngắn sau khi rẽ xong để xe không trôi
+CORNER_TIMEOUT_MS = 5000         # Quay quá lâu mà chưa thoát -> dừng cho an toàn
 
+# --- CHỐNG RẼ LIÊN TIẾP (chống chệch line) ---
+# Sau khi rẽ xong, trong SETTLE_MS tiếp theo xe KHÔNG chốt rẽ nữa mà chỉ nắn nhẹ
+# (bánh trong đứng yên) cho tới khi hết đen. Nhờ vậy xe quay hơi thừa thì chỉ
+# nắn lại chứ không quay thêm một cú nữa.
+SETTLE_MS = 500                  # Thời gian "ổn định" sau mỗi lần rẽ
+FINE_HOLD_MS = 80                # Giữ nắn nhẹ thêm sau khi cảm biến hết đen
+GENTLE_SPEED = 750               # Tốc độ bánh ngoài khi nắn nhẹ
 
-def move_backward():
-  in1.value(0)
-  in2.value(1)
-  in3.value(0)
-  in4.value(1)
-  set_speed(SPEED, SPEED)
-
-
-def turn_left():
-  in1.value(0)
-  in2.value(1)
-  in3.value(1)
-  in4.value(0)
-  set_speed(SPEED, SPEED)
-
-
-def turn_right():
-  in1.value(1)
-  in2.value(0)
-  in3.value(0)
-  in4.value(1)
-  set_speed(SPEED, SPEED)
-
-
-def stop():
-  in1.value(0)
-  in2.value(0)
-  in3.value(0)
-  in4.value(0)
-  set_speed(0, 0)
+# --- VẠCH NGANG ---
+STOP_AT_CROSS = True             # Đang đi thẳng, 2 cảm biến cùng đen -> dừng hẳn
 
 
-# --- 2 CẢM BIẾN TCRT5000 (DO) ---
-# ir_left: GPIO 14, ir_right: GPIO 35 (Input-only phù hợp nhận tín hiệu DO)
-# Quy ước: 0 = trắng bóng, 1 = đen
-ir_left = Pin(14, Pin.IN)
-ir_right = Pin(35, Pin.IN)
+# ============================================================
+#  ĐỘNG CƠ
+# ============================================================
+def set_wheels(left, right):
+    """left/right trong khoảng -1023..1023 (âm = lùi)."""
+    if LEFT_REVERSED:
+        left = -left
+    if RIGHT_REVERSED:
+        right = -right
 
-# --- CẢM BIẾN SIÊU ÂM HC-SR04 ---
-trig = Pin(13, Pin.OUT)
-echo = Pin(34, Pin.IN)  # GPIO 34 dùng làm echo (Input-only)
+    in3.value(1 if left > 0 else 0)
+    in4.value(1 if left < 0 else 0)
+    in1.value(1 if right > 0 else 0)
+    in2.value(1 if right < 0 else 0)
 
-
-def get_distance():
-  trig.value(0)
-  time.sleep_us(2)
-  trig.value(1)
-  time.sleep_us(10)
-  trig.value(0)
-
-  timeout = 30000
-  start_time = time.ticks_us()
-
-  while echo.value() == 0:
-    if time.ticks_diff(time.ticks_us(), start_time) > timeout:
-      return 999
-
-  t1 = time.ticks_us()
-  while echo.value() == 1:
-    if time.ticks_diff(time.ticks_us(), t1) > timeout:
-      return 999
-  t2 = time.ticks_us()
-
-  duration = time.ticks_diff(t2, t1)
-  distance = (duration * 0.0343) / 2
-  return round(distance, 1)
+    enb.duty(min(abs(int(left)), 1023))
+    ena.duty(min(abs(int(right)), 1023))
 
 
-# --- SERVO SG90 (PWM trên GPIO 27) ---
-servo_pin = PWM(Pin(27, Pin.OUT), freq=50)
+def stop_car():
+    set_wheels(0, 0)
 
 
-def set_servo_angle(angle):
-  # angle: 0 (phải), 90 (giữa), 180 (trái)
-  duty = int(26 + (angle / 180.0) * 97)
-  servo_pin.duty(duty)
-  time.sleep_ms(300)
+def go_straight():
+    set_wheels(BASE_SPEED, BASE_SPEED)
 
 
-# --- LOGIC NÉ VẬT CẢN (QUÉT TRÁI 90 ĐỘ -> PHẢI 180 ĐỘ) ---
-def avoid_obstacle():
-  stop()
-  time.sleep_ms(200)
-
-  # 1. Xoay 90 độ sang trái (tương ứng góc 180 độ của servo) để đo phía bên trái
-  set_servo_angle(180)
-  dist_left = get_distance()
-
-  # 2. Xoay tiếp sang phải (từ trái qua phải là 180 độ, tương ứng góc 0 độ của servo) để đo bên phải
-  set_servo_angle(0)
-  dist_right = get_distance()
-
-  # Trả servo về vị trí chính giữa (90 độ)
-  set_servo_angle(90)
-
-  # 3. Lách qua vật cản dựa vào khoảng cách trống hơn
-  if dist_left > dist_right:
-    # Lách qua bên trái
-    turn_left()
-    time.sleep_ms(500)
-    move_forward()
-    time.sleep_ms(600)
-    turn_right()
-    time.sleep_ms(500)
-    move_forward()
-    time.sleep_ms(600)
-    turn_right()
-    time.sleep_ms(400)
-  else:
-    # Lách qua bên phải
-    turn_right()
-    time.sleep_ms(500)
-    move_forward()
-    time.sleep_ms(600)
-    turn_left()
-    time.sleep_ms(500)
-    move_forward()
-    time.sleep_ms(600)
-    turn_left()
-    time.sleep_ms(400)
-
-  stop()
-
-
-# --- CHƯƠNG TRÌNH CHÍNH ---
-def main():
-  set_servo_angle(90)  # Đưa servo về giữa
-  time.sleep(1)
-
-  SAFE_DISTANCE = 15.0  # Khoảng cách phát hiện vật cản (cm)
-
-  while True:
-    # 1. Kiểm tra vật cản phía trước bằng HC-SR04
-    dist_front = get_distance()
-    if dist_front < SAFE_DISTANCE:
-      avoid_obstacle()
-
-    # 2. Đọc giá trị cảm biến dò line (0: trắng bóng, 1: đen)
-    left_val = ir_left.value()
-    right_val = ir_right.value()
-
-    # 3. NHẬN BIẾT ĐÍCH: Nếu cả 2 cảm biến đều chạm vạch đen (1 và 1)
-    if left_val == 1 and right_val == 1:
-      stop()
-      print("Đã đến đích!")
-      while True:
-        pass  # Dừng hẳn chương trình tại đích
-
-    # 4. Logic dò line tiêu chuẩn (0: trắng bóng, 1: đen)
-    # Cả 2 đều trên nền trắng bóng (0 và 0): Đi thẳng
-    if left_val == 0 and right_val == 0:
-      move_forward()
-    # Cảm biến trái lệch vào line đen (1), phải ở nền trắng (0) -> Bẻ lái trái
-    elif left_val == 1 and right_val == 0:
-      turn_left()
-    # Cảm biến phải lệch vào line đen (1), trái ở nền trắng (0) -> Bẻ lái phải
-    elif left_val == 0 and right_val == 1:
-      turn_right()
+def pivot(direction):
+    # Quay tại chỗ: rẽ trái = bánh trái lùi + bánh phải tiến, rẽ phải ngược lại
+    if direction == "left":
+        set_wheels(-TURN_SPEED, TURN_SPEED)
     else:
-      move_forward()
+        set_wheels(TURN_SPEED, -TURN_SPEED)
 
-    time.sleep_ms(10)
+
+def gentle(direction):
+    # Nắn nhẹ: bánh trong đứng yên, bánh ngoài chạy tiến
+    if direction == "left":
+        set_wheels(0, GENTLE_SPEED)
+    else:
+        set_wheels(GENTLE_SPEED, 0)
+
+
+def test_motors():
+    steps = (
+        ("Bánh TRÁI tiến", (BASE_SPEED, 0)),
+        ("Bánh PHẢI tiến", (0, BASE_SPEED)),
+        ("CẢ HAI tiến", (BASE_SPEED, BASE_SPEED)),
+        ("CẢ HAI lùi", (-BASE_SPEED, -BASE_SPEED)),
+    )
+    print("NHẤC BÁNH XE KHỎI MẶT ĐẤT! Bắt đầu sau 3 giây...")
+    time.sleep(3)
+    for name, (l, r) in steps:
+        print(name)
+        set_wheels(l, r)
+        time.sleep(2)
+        stop_car()
+        time.sleep(1)
+    print("Xong test động cơ.")
+
+
+# ============================================================
+#  CẢM BIẾN (lọc nhiễu nhẹ)
+# ============================================================
+def raw_sensors():
+    return (ir_left.value() == ON_LINE, ir_right.value() == ON_LINE)
+
+
+def read_sensors(prev):
+    """Đọc 2 lần liên tiếp, giống nhau mới nhận; khác nhau thì giữ giá trị cũ."""
+    a = raw_sensors()
+    time.sleep_us(300)
+    b = raw_sensors()
+    return b if a == b else prev
+
+
+# ============================================================
+#  CHƯƠNG TRÌNH CHÍNH
+# ============================================================
+def main():
+    stop_car()
+
+    if TEST_MOTOR:
+        test_motors()
+        return
+
+    print("Chờ", START_DELAY_S, "giây trước khi xuất phát...")
+    time.sleep(START_DELAY_S)
+    print("Bắt đầu dò line")
+
+    sensors = (False, False)
+    mode = "run"                # "run" = đi thẳng/nắn nhẹ, "turn" = đang rẽ chốt
+    direction = None            # hướng rẽ gần nhất
+    turn_start = time.ticks_ms()
+    settle_until = turn_start   # trước mốc này: chỉ nắn nhẹ, không chốt rẽ
+    fine_until = turn_start     # giữ nắn nhẹ tới mốc này
+    fine_dir = None
+    last_print = turn_start
+
+    while True:
+        sensors = read_sensors(sensors)
+        l, r = sensors
+        now = time.ticks_ms()
+
+        if mode == "turn":
+            elapsed = time.ticks_diff(now, turn_start)
+            if elapsed < TURN_TIME_MS:
+                pass                                    # BỎ QUA cảm biến, cứ quay
+            elif not l and not r:
+                # Đã quay đủ và vạch đã nằm giữa -> phanh ngắn, đi thẳng
+                if TURN_BRAKE_MS > 0:
+                    stop_car()
+                    time.sleep_ms(TURN_BRAKE_MS)
+                mode = "run"
+                fine_dir = None
+                now = time.ticks_ms()
+                settle_until = time.ticks_add(now, SETTLE_MS)
+                go_straight()
+            elif elapsed > CORNER_TIMEOUT_MS:
+                print("Quay quá lâu -> dừng")
+                break
+            # else: còn đen (góc dày) -> quay tiếp
+
+        else:
+            settling = time.ticks_diff(settle_until, now) > 0
+
+            if l and r:
+                if settling:
+                    gentle(direction or "left")         # chưa ra khỏi góc: nắn theo hướng cũ
+                elif STOP_AT_CROSS:
+                    print("Gặp vạch ngang -> dừng")
+                    break
+                else:
+                    go_straight()
+
+            elif l or r:
+                d = "left" if l else "right"
+                if settling:
+                    # Vừa rẽ xong: chỉ NẮN NHẸ, không chốt rẽ nữa
+                    fine_dir = d
+                    fine_until = time.ticks_add(now, FINE_HOLD_MS)
+                    gentle(d)
+                else:
+                    # Cảm biến nháy MỘT cái -> chốt rẽ
+                    direction = d
+                    if TURN_PAUSE_MS > 0:
+                        stop_car()
+                        time.sleep_ms(TURN_PAUSE_MS)
+                    pivot(direction)
+                    turn_start = time.ticks_ms()
+                    mode = "turn"
+
+            else:
+                if fine_dir is not None and time.ticks_diff(fine_until, now) > 0:
+                    gentle(fine_dir)                    # giữ nắn thêm một chút
+                else:
+                    fine_dir = None
+                    go_straight()
+
+        if DEBUG and time.ticks_diff(now, last_print) >= 500:
+            last_print = now
+            print("L:", int(l), "R:", int(r), "| mode:", mode, "| huong:", direction)
+
+        time.sleep_ms(1)
 
 
 if __name__ == "__main__":
-  main()
+    try:
+        main()
+    finally:
+        stop_car()
+        ena.duty(0)
+        enb.duty(0)
